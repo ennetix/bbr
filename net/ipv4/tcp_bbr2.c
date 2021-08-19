@@ -426,6 +426,16 @@ static void bbr2_reset_congestion_signals(struct sock *sk);
 
 static void bbr_check_probe_rtt_done(struct sock *sk);
 
+static u32 itp_ewma(u32 current_val, u32 last_avg)
+{
+	if (!last_avg) {
+		return current_val;
+	} else {
+		/* TODO: Allow configuring EWMA parameters instead of hard coding here. */
+		return (3ULL * current_val + last_avg) / 4ULL;
+	}
+}
+
 /* Do we estimate that STARTUP filled the pipe? */
 static bool bbr_full_bw_reached(const struct sock *sk)
 {
@@ -1159,7 +1169,7 @@ static void bbr_update_min_rtt(struct sock *sk, const struct rate_sample *rs)
 	min_rtt_expired = after(tcp_jiffies32, expire);
 	if (bbr->probe_rtt_min_us <= bbr->min_rtt_us ||
 	    min_rtt_expired) {
-		bbr->min_rtt_us = bbr->probe_rtt_min_us;
+		bbr->min_rtt_us = itp_ewma(bbr->probe_rtt_min_us, bbr->min_rtt_us);
 		bbr->min_rtt_stamp = bbr->probe_rtt_min_stamp;
 	}
 
@@ -1697,6 +1707,7 @@ static void bbr2_update_congestion_signals(
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct bbr *bbr = inet_csk_ca(sk);
 	u64 bw;
+	u32 bw_latest;
 
 	bbr->loss_round_start = 0;
 	if (rs->interval_us <= 0 || !rs->acked_sacked)
@@ -1709,21 +1720,23 @@ static void bbr2_update_congestion_signals(
 	bbr->loss_in_round |= (rs->losses > 0);
 
 	/* Update rate and volume of delivered data from latest round trip: */
-	bbr->bw_latest       = max_t(u32, bbr->bw_latest,       ctx->sample_bw);
+	bw_latest            = max_t(u32, bbr->bw_latest,       ctx->sample_bw);
 	bbr->inflight_latest = max_t(u32, bbr->inflight_latest, rs->delivered);
 
-	if (before(rs->prior_delivered, bbr->loss_round_delivered))
-		return;		/* skip the per-round-trip updates */
-	/* Now do per-round-trip updates. */
-	bbr->loss_round_delivered = tp->delivered;  /* mark round trip */
-	bbr->loss_round_start = 1;
-	bbr2_adapt_lower_bounds(sk);
+	if (!before(rs->prior_delivered, bbr->loss_round_delivered)) {
+		/* Now do per-round-trip updates. */
+		bbr->loss_round_delivered = tp->delivered;  /* mark round trip */
+		bbr->loss_round_start = 1;
+		bbr2_adapt_lower_bounds(sk);
 
-	/* Update windowed "latest" (single-round-trip) filters. */
-	bbr->loss_in_round = 0;
-	bbr->ecn_in_round  = 0;
-	bbr->bw_latest = ctx->sample_bw;
-	bbr->inflight_latest = rs->delivered;
+		/* Update windowed "latest" (single-round-trip) filters. */
+		bbr->loss_in_round = 0;
+		bbr->ecn_in_round  = 0;
+		bw_latest = ctx->sample_bw;
+		bbr->inflight_latest = rs->delivered;
+	}
+
+	bbr->bw_latest = itp_ewma(bw_latest, bbr->bw_latest);
 }
 
 /* Bandwidth probing can cause loss. To help coexistence with loss-based
